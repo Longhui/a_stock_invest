@@ -1,0 +1,28 @@
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.test.exe
+go.work
+go.work.sum
+
+# 编译缓存
+__debug_bin*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 日志
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db
