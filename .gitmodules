@@ -1,0 +1,6 @@
+[submodule "tdx-api"]
+	path = tdx-api
+	url = https://github.com/oficcejo/tdx-api.git
+[submodule "bullet-trade"]
+	path = bullet-trade
+	url = git@github.com:BulletTrade/bullet-trade.git
