@@ -18,6 +18,17 @@ go run main.go -date 2026-07-14 -skip-macd -debug
 # Run backtest
 go run cmd/backtest/main.go
 
+# Paper trading (simulated real-time)
+go run cmd/paper/main.go monitor              # 09:35~14:50 自动盯盘卖出+尾盘清算买入
+go run cmd/paper/main.go settle               # 14:50 选股买入+记账 (卖出由monitor处理)
+go run cmd/paper/main.go sell                 # 手动止盈止损检查
+go run cmd/paper/main.go buy                  # 仅买入
+go run cmd/paper/main.go status               # 当前持仓状态
+go run cmd/paper/main.go list                 # 成交记录
+go run cmd/paper/main.go nav                  # 每日净值
+go run cmd/paper/main.go reset                # 重置模拟盘
+go run cmd/paper/main.go settle -date 2026-07-15  # 指定日期
+
 # Run all tests
 go test ./...
 
@@ -39,6 +50,11 @@ strategy/
 │   ├── backtest/main.go             # Backtesting entry point
 │   └── tail_20_2/main.go            # Strategy-specific backtest entry
 ├── internal/
+│   ├── paper/
+│   │   ├── types.go                # PaperConfig, StoredPosition, Trade, DailyRecord, PaperState
+│   │   ├── state.go                # JSON state persistence (load/save)
+│   │   ├── engine.go               # Paper trading logic: monitor, sell, settle, buy
+│   │   └── reporter.go             # Status output, trade history, NAV curve display
 │   ├── provider/provider.go         # Data provider: local TDX .day files + tdx-api network fallback + caching
 │   ├── reader/
 │   │   ├── dayfile.go              # Binary .day file read/write (32-byte records), MA/EMA/SMA/StdDev helpers
@@ -91,6 +107,30 @@ backtest.Engine.Run():
     2. CheckMACD() for market environment
     3. buyStocks() → SelectCandidates() → BuildRiskInputs() → ProcessAll() → execute buy
     4. recordDailyValue()
+```
+
+### Paper Trading Flow
+```
+paper.Engine.RunMonitor():              # 09:35 kickoff, runs until 14:50
+  loop every 2 min:
+    for each position:
+      fetch 1-min klines → compute HLOC
+      stop-loss triggered?  → sell ✗
+      take-profit triggered? → sell ✓
+      otherwise → hold
+    save checkpoint to paper_state.json
+
+  14:50 → auto settle:
+    1. force-sell remaining positions (full CheckSell)
+    2. check MACD
+    3. select stocks → risk control → buy top N
+    4. record daily NAV → save state → exit
+
+paper.Engine.RunSettle():             # standalone 14:50 command
+  1. MACD check → buy stocks
+  2. record daily NAV → save state
+
+paper state persisted in paper_state.json (auto-created on first run)
 ```
 
 ### Stock Selection Logic (`selector.strategy.go`)
