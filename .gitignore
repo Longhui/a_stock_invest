@@ -23,6 +23,9 @@ __debug_bin*
 # 日志
 *.log
 
+# 模拟盘状态
+paper_state.json
+
 # 系统
 .DS_Store
 Thumbs.db

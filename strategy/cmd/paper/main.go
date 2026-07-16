@@ -80,6 +80,10 @@ func main() {
 		eng := paper.NewEngine(cfg)
 		eng.PrintDailyValues()
 
+	case "mail", "report":
+		eng := paper.NewEngine(cfg)
+		eng.SendReport()
+
 	case "reset":
 		fmt.Print("确认重置模拟盘? 输入 YES 确认: ")
 		var s string

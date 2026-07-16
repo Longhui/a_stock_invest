@@ -45,6 +45,9 @@ type Provider struct {
 	sectorMap     reader.SectorMap
 	sectorOnce    sync.Once
 	sectorMapErr  error
+
+	// 强制刷新: 跳过本地 .day 文件，直接从 API 获取（用于盘后清算等需要最新数据的场景）
+	forceAPI bool
 }
 
 func NewProvider(tdxDir string) *Provider {
@@ -54,18 +57,68 @@ func NewProvider(tdxDir string) *Provider {
 	}
 }
 
+// SetForceAPI 设置强制API模式。启用后 GetKlines 跳过本地 .day 文件，直奔缓存/API。
+// 启用时自动清空缓存目录，确保所有数据从 API 重新获取。
+// 用于盘后清算等需要确保包含今日日K线的场景。
+func (p *Provider) SetForceAPI(v bool) {
+	p.forceAPI = v
+	if v {
+		// 清空缓存，强制所有数据从 API 重新获取
+		if cacheDir := p.CacheDir + "/cache_klines"; cacheDir != "" {
+			os.RemoveAll(cacheDir)
+		}
+	}
+}
+
+// NeedRefresh 检查指定股票的数据是否过期（最后交易日的数据是否包含）
+// 返回 true 表示需要从 API 获取最新数据
+func (p *Provider) NeedRefresh(code string) bool {
+	path, exists, err := reader.DayFileExists(p.TDXDir, code)
+	if err != nil || !exists {
+		return true
+	}
+	records, err := reader.ReadDayFile(path)
+	if err != nil || len(records) == 0 {
+		return true
+	}
+	return isStale(records[len(records)-1].Date)
+}
+
+// isStale 判断最后一个bar的日期是否已经过时（早于最近交易日）
+func isStale(lastBarDate time.Time) bool {
+	last := lastBarDate.Truncate(24 * time.Hour)
+	// 期望最新数据应包含最近交易日的日期
+	expected := lastTradingDay(time.Now())
+	return last.Before(expected)
+}
+
+// lastTradingDay 返回最近的一个交易日（往前退到最近的工作日）
+func lastTradingDay(t time.Time) time.Time {
+	t = t.Truncate(24 * time.Hour)
+	for {
+		w := t.Weekday()
+		if w >= time.Monday && w <= time.Friday {
+			return t
+		}
+		t = t.AddDate(0, 0, -1)
+	}
+}
+
 // GetKlines 获取K线数据(本地优先→缓存→tdx-api回退)
 func (p *Provider) GetKlines(code string, minBars int) ([]Kline, error) {
-	// 1. 尝试本地 .day 文件(通达信原始数据)
-	path, exists, err := reader.DayFileExists(p.TDXDir, code)
-	if err == nil && exists {
-		records, err := reader.ReadDayFile(path)
-		if err == nil && len(records) >= minBars {
-			return convertToKlines(records, code), nil
+	// 强制API模式 → 跳过本地 .day 文件
+	if !p.forceAPI {
+		// 1. 尝试本地 .day 文件(通达信原始数据)
+		path, exists, err := reader.DayFileExists(p.TDXDir, code)
+		if err == nil && exists {
+			records, err := reader.ReadDayFile(path)
+			if err == nil && len(records) >= minBars {
+				return convertToKlines(records, code), nil
+			}
 		}
 	}
 
-	// 2. 检查本地缓存
+	// 2. 检查本地缓存（API模式先看缓存，没有再走API）
 	cachePath := p.cacheFilePath(code)
 	if cachePath != "" {
 		cacheRecords, err := reader.ReadDayFile(cachePath)
@@ -78,6 +131,58 @@ func (p *Provider) GetKlines(code string, minBars int) ([]Kline, error) {
 	return p.getKlinesFromAPI(code, minBars)
 }
 
+// RefreshDailyData 并行刷新全市场日K线数据到本地缓存
+// 使用8个独立连接并发获取，适用于盘后清算前确保数据最新
+func (p *Provider) RefreshDailyData(codes []string) {
+	if len(codes) == 0 {
+		return
+	}
+
+	workers := 8
+	jobCh := make(chan string, len(codes))
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client, err := tdx.DialDefault(tdx.WithDebug(false))
+			if err != nil {
+				return
+			}
+			defer client.Close()
+			for code := range jobCh {
+				resp, err := client.GetKlineDayAll(code)
+				if err != nil || resp == nil || len(resp.List) == 0 {
+					continue
+				}
+				records := make([]reader.DayRecord, len(resp.List))
+				for j, k := range resp.List {
+					records[j] = reader.DayRecord{
+						Date:   k.Time,
+						Open:   k.Open.Float64(),
+						High:   k.High.Float64(),
+						Low:    k.Low.Float64(),
+						Close:  k.Close.Float64(),
+						Volume: int64(k.Volume),
+						Amount: k.Amount.Float64(),
+					}
+				}
+				if cachePath := p.cacheFilePath(code); cachePath != "" {
+					os.MkdirAll(p.CacheDir+"/cache_klines", 0755)
+					reader.SaveDayFile(cachePath, records)
+				}
+			}
+		}()
+	}
+
+	for _, code := range codes {
+		jobCh <- code
+	}
+	close(jobCh)
+	wg.Wait()
+}
+
 func (p *Provider) cacheFilePath(code string) string {
 	if p.CacheDir == "" {
 		return ""
@@ -87,9 +192,26 @@ func (p *Provider) cacheFilePath(code string) string {
 }
 
 func (p *Provider) getKlinesFromAPI(code string, minBars int) ([]Kline, error) {
-	client, err := p.getClient()
-	if err != nil {
-		return nil, err
+	// 强制API模式：创建独立连接，支持并发调用
+	// 非强制模式：使用共享连接
+	var client *tdx.Client
+	var err error
+	var closeClient bool
+
+	if p.forceAPI {
+		client, err = tdx.DialDefault(tdx.WithDebug(false))
+		if err != nil {
+			return nil, fmt.Errorf("连接tdx服务器失败: %w", err)
+		}
+		closeClient = true
+	} else {
+		client, err = p.getClient()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if closeClient {
+		defer client.Close()
 	}
 
 	// 指数用 GetIndexDayAll，股票用 GetKlineDayAll
